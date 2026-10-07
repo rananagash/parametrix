@@ -45,7 +45,8 @@ public class CadRunner {
             process = new ProcessBuilder(executable, "--export-format", "binstl", "-o", output.toString(), input.toString())
                     .directory(directory.toFile()).start();
             final Process running = process;
-            try (var readers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var readers = Executors.newVirtualThreadPerTaskExecutor();
+            try {
                 Future<String> stdout = readers.submit(() -> drain(running.getInputStream(), log));
                 Future<String> stderr = readers.submit(() -> drain(running.getErrorStream(), log));
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout);
@@ -61,6 +62,9 @@ public class CadRunner {
                 if (process.exitValue() != 0 || diagnostics.contains("ERROR:") || !validStl(output))
                     return new Result(false, "OpenSCAD failed or produced empty/invalid geometry.\n" + diagnostics, null);
                 return new Result(true, diagnostics, output);
+            } finally {
+                if (process.isAlive()) kill(process);
+                readers.shutdownNow();
             }
         } catch (IllegalArgumentException e) { return new Result(false, e.getMessage(), null);
         } catch (Exception e) { return new Result(false, "OpenSCAD execution failed: " + e.getMessage(), null);
