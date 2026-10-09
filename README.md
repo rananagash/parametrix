@@ -1,6 +1,14 @@
 # Parametrix
 
-Local AI-to-CAD workspace: Gemini → parametric OpenSCAD → STL, with compiler-driven repairs, SSE logs, an editable source pane, and an interactive Three.js preview.
+Parametrix is a local AI-powered CAD tool that turns everyday language into real 3D models. Instead of requiring you to learn complex 3D modeling software, it takes a typed prompt describing an object and its dimensions, uses Google's Gemini model to write clean parametric code in OpenSCAD, and automatically compiles that code into a standard STL file ready for 3D printing or rendering.
+
+Behind the scenes, it acts like an automated engineer:
+
+- It fixes its own mistakes: If OpenSCAD runs into a syntax or geometry error, Parametrix captures the exact compiler error and asks Gemini to repair the code automatically.
+
+- It keeps you in control: You can watch compilation logs live, manually tweak the generated OpenSCAD code in a built-in code editor, and re-render on the fly without using AI tokens.
+
+- Interactive 3D viewing: Once compiled, the model appears in an in-browser 3D viewport where you can rotate, pan, zoom, inspect dimensions, and download the raw .scad and .stl files.
 
 ## Requirements
 
@@ -81,3 +89,73 @@ npm run build
 ```
 
 Backend tests cover repairs, failures, timeout/descendant termination, cancellation, invalid and empty meshes, busy rejection, SSE replay, and expiration. Frontend tests exercise generation, editing/manual rendering, cancellation, errors, and retention of the previous preview. To smoke-test the full pipeline, start both services with a valid key, generate a `10 × 20 × 30 mm cube`, inspect logs and mesh, and download the STL.
+
+
+
+## Architecture & Implementation
+
+Parametrix is built as a single-user local application using a **Spring Boot (Java)** backend and a **TypeScript / React** frontend. It avoids heavy cloud infrastructure and keeps all API keys strictly on the server side.
+
+### 1. AI Generation & Structured Output
+
+* **Model Integration:** Interfaces with the Gemini API via Spring's REST client with a **60-second request deadline**. The API key (`GEMINI_API_KEY`) and model (`GEMINI_MODEL`) reside server-side.
+* **Structured Schema:** Gemini is constrained to return a structured JSON object containing the raw OpenSCAD source.
+* **Prompt Guardrails:** Instructed to generate self-contained geometry using named parametric dimension variables with millimeters as default units. It disallows external asset calls.
+
+### 2. Multi-Pass Compiler Repair Loop
+
+* **Cycle Limits:** Runs 1 initial generation plus up to **3 automated repair attempts** (a maximum of 4 compilation cycles per prompt job).
+* **Feedback Mechanism:** When compilation fails, the system feeds the user's original prompt, the failed source code, and bounded compiler diagnostics back to Gemini to request targeted code fixes.
+* **Fast Exit:** Authentication and provider errors fail immediately without burning retry attempts.
+
+### 3. Native CAD Execution & Concurrency
+
+* **Process Isolation:** Runs the native OpenSCAD CLI directly using Java `ProcessBuilder` (no shell execution) inside an isolated temporary directory per attempt.
+* **Virtual Threads & Stream Draining:** Java virtual threads concurrently drain `stdout` and `stderr` to prevent OS-level pipe buffer deadlocks.
+* **Execution Limits:**
+* Strict **30-second hard timeout** per render attempt.
+* Process tree termination: On timeout or cancellation, the parent process and all OS descendants are terminated immediately.
+* Console output is capped at **32,768 characters per stream** to prevent memory exhaustion.
+* Single active job policy: Rejects concurrent job submissions with a busy response. Completed jobs expire after **1 hour**, and temporary artifacts are wiped on shutdown.
+
+
+
+### 4. Security & STL Binary Validation
+
+* **Source Inspection:** Pre-execution static analysis rejects scripts containing `include`, `use`, `import`, or `surface` to prevent file access or path traversal.
+* **Binary STL Inspection:** Before any model is exposed to the frontend, the raw binary STL is parsed and validated:
+* Rejects files larger than **50 MB**.
+* Confirms headers match declared triangle counts.
+* Detects non-finite (`NaN` / `Infinity`) floating-point coordinates.
+* Rejects empty, corrupt, or entirely degenerate meshes (zero-area triangles).
+
+
+
+### 5. API Design & Real-Time SSE
+
+The backend exposes **7 REST and Server-Sent Events (SSE) endpoints**:
+
+* `POST /api/jobs`: Submits a text prompt (enables auto-repair) or manually edited code (compiles once). Returns `202 Accepted` with a Job ID.
+* `GET /api/jobs/{id}`: Returns status, attempt counts, diagnostics, and artifact links.
+* `GET /api/jobs/{id}/events`: Streams live status, log outputs, and code updates over SSE. Implements ordered event replays using `Last-Event-ID` and sends **15-second heartbeat comments** to sustain long-polling connections.
+* `DELETE /api/jobs/{id}`: Cancels active compilation runs.
+* `GET /api/jobs/{id}/stl` & `GET /api/jobs/{id}/source`: Secure, internal ID-resolved download endpoints for `.stl` and `.scad` files.
+
+### 6. Interactive Frontend & 3D Dashboard
+
+* **Stack:** Built with TypeScript, npm, and **React Three Fiber (Three.js)**.
+* **State Handling:** If a new generation or repair attempt fails, the 3D viewport retains the last successful mesh rather than crashing or clearing to an empty screen.
+* **3D Features:** Includes OrbitControls, automatic camera framing (fit-to-model), ambient and directional lighting, and an orientation grid.
+* **Dual Workflow:** Supports automated natural-language generation as well as an in-browser code editor with an instant "Render" button for manual parameter adjustments.
+
+### 7. Validation & Verification
+
+The system was verified through automated end-to-end unit, integration, and UI tests:
+
+| Scope | Test Target | Results & Verified Behaviors |
+| --- | --- | --- |
+| **Backend Suite** | 18 Automated Tests | Verified successful prompt generation, single-cycle and multi-cycle repair successes, exhaustion after 3 repair attempts, provider API failures, rejection of file-access syntax, empty/malformed STL detection, 30s timeouts, cancellation triggers, and concurrent job lock rejection. |
+| **SSE & Replay** | Streaming Integration | Confirmed strict event ordering, successful event replay upon reconnection via `Last-Event-ID`, and delivery of terminal job states. |
+| **Runner & CAD** | Native Process & Bounds Check | Verified `ProcessBuilder` execution capture and descendant termination. Tested OpenSCAD rendering of a dimensioned reference cube, confirming an exact **12-triangle STL** measuring **10 × 20 × 30 mm**. |
+| **Frontend Suite** | 3 Automated Tests | Validated prompt submission, code editor state changes, manual re-compilation, error boundary presentation, and retention of previous successful meshes during render failures. |
+| **Build & Quality** | Linting & Compiles | Zero TypeScript errors, clean linter runs, successful production asset build, and confirmed responsive dashboard rendering without horizontal overflow. |
